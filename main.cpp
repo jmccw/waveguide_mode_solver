@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-//#include "wg_solver.h"
+#include "wg_solver.h"
 
 #include <Eigen/Sparse>
 #include <Spectra/GenEigsRealShiftSolver.h>
@@ -33,6 +33,14 @@ static const double block_size = 3.4e-6;   // full computational window
 const double n_SiO2 = 1.444;
 const double n_air = 1.0;
 
+// Result of the eigen solve, sorted by n_eff^2 (descending) via `order`.
+//~ struct ModeResult {
+    //bool               converged = false;
+    //~ Eigen::VectorXcd   eigenvalues;
+    //~ Eigen::MatrixXcd   eigenvectors;
+    //~ std::vector<std::pair<double, int>> order;   // (n_eff^2, column index)
+//~ };
+
 class wg_simulation {
 	
 	private:
@@ -42,6 +50,10 @@ class wg_simulation {
 		
 		std::vector<std::vector<double>> spatial_pos;
 		std::vector<std::vector<double>> epsilon_r;
+		
+		std::vector<std::string> string_mode_type = {"E_TE_", "E_TM_", "H_TE_", "H_TM_"};
+		std::vector<ModeResult> computed_modes = std::vector<ModeResult>(4);
+		// [0] = E_TE, [1] = E_TM, [2] = H_TE, [3] = H_TM
 		
 		double dx = 5e-9;
 		double dy = 50e-9;
@@ -53,12 +65,342 @@ class wg_simulation {
 		const int ncv       = 30;   // > num_modes (+1), <= matrix dimension
 		int M_x = 0; // initialised to zero
 		int M_y = 0; 
+		int N_p;
+		int N_q;
+		int M;
+
 		
 		bool write_files_out = true;
 		bool write_to_console = true;
 		
 		bool mesh_initilised = false; // false by default.
 			// user should define a mesh type.
+			
+		void mesh_initialisation(bool state) {
+			if(state == true) {
+				N_p = M_x - 2;
+				N_q = M_y - 2;
+				M   = N_p * N_q;
+				mesh_initilised = true;
+			} else mesh_initilised = false;
+		}
+		
+		auto index_of(int p, int q) { return (p - 1) * N_q + (q - 1); }
+		auto is_unknown(int p, int q) {
+			return p >= 1 && p <= M_x - 2 && q >= 1 && q <= M_y - 2;
+		}
+		
+		Eigen::SparseMatrix<double> assemble_matrix(int mode_type) {
+			
+			if (write_to_console == true)
+				std::cout << "Matrix size: " << M << " x " << M << "\n(dx=" << dx*1e6 
+						  << "um dy=" << dy*1e6 << "um)" << std::endl;
+
+			switch(mode_type)
+			{
+				// E_TE
+				case 0:{
+
+					// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
+					// Eq. (4.99) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
+					// the eigenvalue is n_eff^2.
+
+					std::vector<Eigen::Triplet<double>> triplets;
+					triplets.reserve(5 * static_cast<size_t>(M));
+
+					for (int p = 1; p <= M_x - 2; ++p) {
+						for (int q = 1; q <= M_y - 2; ++q) {
+
+							// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
+							// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
+							const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
+							const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
+							const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
+							const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
+
+							const double eps   = epsilon_r[p][q];
+							const double eps_w = epsilon_r[p - 1][q];
+							const double eps_e = epsilon_r[p + 1][q];
+
+							// Eqs. (4.100)-(4.105)
+							const double alpha_w = 2.0 / (w * (e + w)) * (2.0 * eps_w) / (eps + eps_w);
+							const double alpha_e = 2.0 / (e * (e + w)) * (2.0 * eps_e) / (eps + eps_e);
+							const double alpha_n = 2.0 / (n * (n + s));
+							const double alpha_s = 2.0 / (s * (n + s));
+
+							const double alpha_x = -4.0 / (e * w) + alpha_e + alpha_w;   // (4.104)
+							const double alpha_y = -alpha_n - alpha_s;                   // (4.105)
+
+							const int r = index_of(p, q);
+
+							triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
+
+							// Couplings to neighbours; neighbours on the Dirichlet boundary
+							// are zero and are simply dropped.
+							if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
+							if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
+							if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
+							if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
+						}
+					}
+
+					Eigen::SparseMatrix<double> A(M, M);
+					A.setFromTriplets(triplets.begin(), triplets.end());
+					A.makeCompressed();
+
+					return A;
+				}
+				
+				// E_TM
+				case 1:{
+					// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
+					// Eq. (4.133) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
+					// the eigenvalue is n_eff^2.
+					std::vector<Eigen::Triplet<double>> triplets;
+					triplets.reserve(5 * static_cast<size_t>(M));
+
+					for (int p = 1; p <= M_x - 2; ++p) {
+						for (int q = 1; q <= M_y - 2; ++q) {
+
+							// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
+							// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
+							const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
+							const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
+							const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
+							const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
+
+							const double eps   = epsilon_r[p][q];
+							const double eps_n = epsilon_r[p][q - 1];
+							const double eps_s = epsilon_r[p][q + 1];
+
+							// Eqs. (4.134)-(4.139). Note the permittivity weighting sits on the
+							// y-neighbours (n, s), the opposite of the quasi-TE case.
+							const double alpha_w = 2.0 / (w * (e + w));
+							const double alpha_e = 2.0 / (e * (e + w));
+							const double alpha_n = 2.0 / (n * (n + s)) * (2.0 * eps_n) / (eps + eps_n);
+							const double alpha_s = 2.0 / (s * (n + s)) * (2.0 * eps_s) / (eps + eps_s);
+
+							const double alpha_x = -alpha_e - alpha_w;                   // (4.138)
+							const double alpha_y = -4.0 / (n * s) + alpha_n + alpha_s;   // (4.139)
+
+							const int r = index_of(p, q);
+
+							triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
+
+							// Couplings to neighbours; neighbours on the Dirichlet boundary
+							// are zero and are simply dropped.
+							if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
+							if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
+							if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
+							if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
+						}
+					}
+
+
+					Eigen::SparseMatrix<double> A(M, M);
+					A.setFromTriplets(triplets.begin(), triplets.end());
+					A.makeCompressed();
+					
+					return A;
+				}
+				
+				// H_TE
+				case 2:{
+					// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
+					// Eq. (4.123) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
+					// the eigenvalue is n_eff^2.
+					std::vector<Eigen::Triplet<double>> triplets;
+					triplets.reserve(5 * static_cast<size_t>(M));
+
+					for (int p = 1; p <= M_x - 2; ++p) {
+						for (int q = 1; q <= M_y - 2; ++q) {
+
+							// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
+							// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
+							const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
+							const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
+							const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
+							const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
+
+							const double eps   = epsilon_r[p][q];
+							const double eps_w = epsilon_r[p - 1][q];
+							const double eps_e = epsilon_r[p + 1][q];
+
+							// Eqs. (4.124)-(4.129): weighting on the x-neighbours (w, e),
+							// plain Laplacian in y.
+							const double alpha_w = 2.0 / (w * (e + w)) * (2.0 * eps) / (eps + eps_w);
+							const double alpha_e = 2.0 / (e * (e + w)) * (2.0 * eps) / (eps + eps_e);
+							const double alpha_n = 2.0 / (n * (n + s));
+							const double alpha_s = 2.0 / (s * (n + s));
+
+							const double alpha_x = -alpha_e - alpha_w;   // (4.128)
+							const double alpha_y = -alpha_n - alpha_s;   // (4.129)
+
+							const int r = index_of(p, q);
+
+							triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
+
+							// Couplings to neighbours; neighbours on the Dirichlet boundary
+							// are zero and are simply dropped.
+							if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
+							if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
+							if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
+							if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
+						}
+					}
+
+					Eigen::SparseMatrix<double> A(M, M);
+					A.setFromTriplets(triplets.begin(), triplets.end());
+					A.makeCompressed();
+					
+					return A;
+				}
+				
+				// H_TM
+				case 3:{
+					// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
+					// Eq. (4.123) with x <-> y, in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
+					// the eigenvalue is n_eff^2.
+					std::vector<Eigen::Triplet<double>> triplets;
+					triplets.reserve(5 * static_cast<size_t>(M));
+
+					for (int p = 1; p <= M_x - 2; ++p) {
+						for (int q = 1; q <= M_y - 2; ++q) {
+
+							// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
+							// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
+							const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
+							const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
+							const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
+							const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
+
+							const double eps   = epsilon_r[p][q];
+							const double eps_n = epsilon_r[p][q - 1];
+							const double eps_s = epsilon_r[p][q + 1];
+
+							// (4.124)-(4.129) with x <-> y, Eq. (4.141): weighting on the
+							// y-neighbours (n, s), plain Laplacian in x.
+							const double alpha_w = 2.0 / (w * (e + w));
+							const double alpha_e = 2.0 / (e * (e + w));
+							const double alpha_n = 2.0 / (n * (n + s)) * (2.0 * eps) / (eps + eps_n);
+							const double alpha_s = 2.0 / (s * (n + s)) * (2.0 * eps) / (eps + eps_s);
+
+							const double alpha_x = -alpha_e - alpha_w;
+							const double alpha_y = -alpha_n - alpha_s;
+
+							const int r = index_of(p, q);
+
+							triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
+
+							// Couplings to neighbours; neighbours on the Dirichlet boundary
+							// are zero and are simply dropped.
+							if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
+							if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
+							if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
+							if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
+						}
+					}
+
+					Eigen::SparseMatrix<double> A(M, M);
+					A.setFromTriplets(triplets.begin(), triplets.end());
+					A.makeCompressed();
+					
+					return A;
+				}
+
+				default:
+					throw std::invalid_argument("assemble_matrix: unknown mode_type");
+			}
+		}
+
+
+		void solve_arbitrary_mode(int mode_type) 
+		{			
+			if(this->mesh_initilised != true){
+				throw std::runtime_error("Simulation mesh not initialised.\n");
+				return;
+			}
+
+			Eigen::SparseMatrix<double> A = assemble_matrix(mode_type); 
+
+			// ---- shift-invert eigen solve -----------------------------------------
+			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
+			// targets the highest-index (fundamental) modes.
+			
+			const double sigma = core_index * core_index + 0.05;
+
+			Spectra::SparseGenRealShiftSolve<double> op(A);
+			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
+				eigs(op, num_modes, ncv, sigma);
+
+			eigs.init();
+			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
+			
+			//if(write_to_console == true)
+			if (eigs.info() != Spectra::CompInfo::Successful) {
+				std::cerr << "Eigen solve did not converge ("
+						   << " of " << num_modes
+						  << " converged). Try increasing ncv.\n";
+				return;
+			}
+
+			Eigen::VectorXcd eigenvalues = eigs.eigenvalues();
+			Eigen::MatrixXcd V           = eigs.eigenvectors();
+
+			// Sort by n_eff^2 descending
+			std::vector<std::pair<double, int>> order;
+			for (int i = 0; i < eigenvalues.size(); ++i)
+				order.emplace_back(eigenvalues[i].real(), i);
+			std::sort(order.begin(), order.end(),
+					  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+			std::cout << std::fixed << std::setprecision(6);
+			for (size_t m = 0; m < order.size(); ++m) {
+				const double neff2 = order[m].first;
+				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
+				const bool guided  = (neff > clad_index && neff < core_index);
+				if(write_to_console == true) 
+					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
+						  << "  n_eff = " << neff
+						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
+			} // FIXME: The logic here does not work for an arbitrary rib WG.
+			
+			// Add to ModeResult struct.
+			this->computed_modes[mode_type] = ModeResult {eigenvalues, V, order};
+
+			// ---- export -----------------------------------------------------------
+			// Files: x[um] y[um] Re(E) Im(E) |E|^2, normalised to max |E| = 1.
+			// Eigenvectors are real up to a global phase; rotate so the peak is real.
+			
+			if(write_files_out == true) {
+				for (size_t m = 0; m < order.size(); ++m) {
+					const int col = order[m].second;
+
+					int peak = 0;
+					V.col(col).cwiseAbs().maxCoeff(&peak);
+					const std::complex<double> phase = V(peak, col);
+					const double max_E = std::abs(phase);
+
+					std::ofstream file(string_mode_type[mode_type] + std::to_string(m + 1) + ".dat");
+					file << std::setprecision(10);
+
+					for (int p = 0; p < M_x; ++p) {
+						for (int q = 0; q < M_y; ++q) {
+							std::complex<double> E(0.0, 0.0);   // zero on Dirichlet boundary
+							if (is_unknown(p, q) && max_E > 0.0)
+								E = V(index_of(p, q), col) / phase;   // peak -> +1
+
+							file << spatial_pos[0][p] * 1e6 << " "
+								 << spatial_pos[1][q] * 1e6 << " "
+								 << E.real() << " " << E.imag() << " "
+								 << std::norm(E) << "\n";
+						}
+						file << "\n";
+					}
+				}
+			}
+		}
+		
 					
 	public:
 
@@ -67,20 +409,24 @@ class wg_simulation {
 		double window_width; 
 		double dielectric_thickness;
 		
-		void set_dx(double dx_in) { this->mesh_initilised = false; this->dx = dx_in; }
-		void set_dy(double dy_in) { this->mesh_initilised = false; this->dy = dy_in; }
-		void set_propagation_wavelength(double lambda_in) {
+		void set_dx(double dx_in) { mesh_initialisation(false); this->dx = dx_in; }
+		void set_dy(double dy_in) { mesh_initialisation(false); this->dy = dy_in; }
+		
+		void set_propagation_wavelength(double lambda_in) 
+		{
 			this->lambda = lambda_in;
 			this->k_0    = 2.0 * M_PI / lambda_in;
-			this->mesh_initilised = false;
+			// mesh_initialisation(false);
 		}
 		
-		int get_M_x() const {
+		int get_M_x() const 
+		{
 			//~ if (M_x == 0) throw std::logic_error("M_x not initialised");
 			return M_x;
 		}
 		
-		int get_M_y() const {
+		int get_M_y() const 
+		{
 			//~ if (M_y == 0) throw std::logic_error("M_y not initialised");
 			return M_y;
 		}
@@ -252,571 +598,23 @@ class wg_simulation {
 			}
 			
 			// allow matrices to be defined..
-			this->mesh_initilised = true;
-		}
-
-
-		void E_TE() {
-			if(this->mesh_initilised != true){
-				throw std::runtime_error("Simulation mesh not initialised.\n");
-				return;
-			}
-			
-			const int N_p = M_x - 2;
-			const int N_q = M_y - 2;
-			const int M   = N_p * N_q;
-
-			auto index_of = [&](int p, int q) { return (p - 1) * N_q + (q - 1); };
-			auto is_unknown = [&](int p, int q) {
-				return p >= 1 && p <= M_x - 2 && q >= 1 && q <= M_y - 2;
-			};
-
-			// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
-			// Eq. (4.99) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
-			// the eigenvalue is n_eff^2.
-			std::vector<Eigen::Triplet<double>> triplets;
-			triplets.reserve(5 * static_cast<size_t>(M));
-
-			for (int p = 1; p <= M_x - 2; ++p) {
-				for (int q = 1; q <= M_y - 2; ++q) {
-
-					// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
-					// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
-					const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
-					const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
-					const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
-					const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
-
-					const double eps   = epsilon_r[p][q];
-					const double eps_w = epsilon_r[p - 1][q];
-					const double eps_e = epsilon_r[p + 1][q];
-
-					// Eqs. (4.100)-(4.105)
-					const double alpha_w = 2.0 / (w * (e + w)) * (2.0 * eps_w) / (eps + eps_w);
-					const double alpha_e = 2.0 / (e * (e + w)) * (2.0 * eps_e) / (eps + eps_e);
-					const double alpha_n = 2.0 / (n * (n + s));
-					const double alpha_s = 2.0 / (s * (n + s));
-
-					const double alpha_x = -4.0 / (e * w) + alpha_e + alpha_w;   // (4.104)
-					const double alpha_y = -alpha_n - alpha_s;                   // (4.105)
-
-					const int r = index_of(p, q);
-
-					triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
-
-					// Couplings to neighbours; neighbours on the Dirichlet boundary
-					// are zero and are simply dropped.
-					if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
-					if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
-					if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
-					if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
-				}
-			}
-
-			Eigen::SparseMatrix<double> A(M, M);
-			A.setFromTriplets(triplets.begin(), triplets.end());
-			A.makeCompressed();
-
-			if (write_to_console == true)
-				std::cout << "Matrix size: " << M << " x " << M << "\n(dx=" << dx*1e6 
-					<< "um dy=" << dy*1e6 << "um)" << std::endl;
-
-			// ---- shift-invert eigen solve -----------------------------------------
-			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
-			// targets the highest-index (fundamental) modes.
-			const double sigma = core_index * core_index /*+ 0.05*/;
-
-			Spectra::SparseGenRealShiftSolve<double> op(A);
-			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
-				eigs(op, num_modes, ncv, sigma);
-
-			eigs.init();
-			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
-			
-			if(write_to_console == true)
-				if (eigs.info() != Spectra::CompInfo::Successful) {
-					std::cerr << "Eigen solve did not converge ("
-							   << " of " << num_modes
-							  << " converged). Try increasing ncv.\n";
-					return;
-				}
-
-			Eigen::VectorXcd eigenvalues = eigs.eigenvalues();
-			Eigen::MatrixXcd V           = eigs.eigenvectors();
-
-			// Sort by n_eff^2 descending
-			std::vector<std::pair<double, int>> order;
-			for (int i = 0; i < eigenvalues.size(); ++i)
-				order.emplace_back(eigenvalues[i].real(), i);
-			std::sort(order.begin(), order.end(),
-					  [](const auto& a, const auto& b) { return a.first > b.first; });
-
-			std::cout << std::fixed << std::setprecision(6);
-			for (size_t m = 0; m < order.size(); ++m) {
-				const double neff2 = order[m].first;
-				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
-				const bool guided  = (neff > clad_index && neff < core_index);
-				if(write_to_console == true) 
-					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
-						  << "  n_eff = " << neff
-						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
-			}
-
-			// ---- export -----------------------------------------------------------
-			// Files: x[um] y[um] Re(E) Im(E) |E|^2, normalised to max |E| = 1.
-			// Eigenvectors are real up to a global phase; rotate so the peak is real.
-			
-			if(write_files_out == true) {
-				for (size_t m = 0; m < order.size(); ++m) {
-					const int col = order[m].second;
-
-					int peak = 0;
-					V.col(col).cwiseAbs().maxCoeff(&peak);
-					const std::complex<double> phase = V(peak, col);
-					const double max_E = std::abs(phase);
-
-					std::ofstream file("E_TE_mode_" + std::to_string(m + 1) + ".dat");
-					file << std::setprecision(10);
-
-					for (int p = 0; p < M_x; ++p) {
-						for (int q = 0; q < M_y; ++q) {
-							std::complex<double> E(0.0, 0.0);   // zero on Dirichlet boundary
-							if (is_unknown(p, q) && max_E > 0.0)
-								E = V(index_of(p, q), col) / phase;   // peak -> +1
-
-							file << spatial_pos[0][p] * 1e6 << " "
-								 << spatial_pos[1][q] * 1e6 << " "
-								 << E.real() << " " << E.imag() << " "
-								 << std::norm(E) << "\n";
-						}
-						file << "\n";
-					}
-				}
-			}
-
+			mesh_initialisation(true);
 		}
 		
-		void H_TE() {
-			if(this->mesh_initilised != true){
-				throw std::runtime_error("Simulation mesh not initialised.\n");
-				return;
-			}
-			
-			const int N_p = M_x - 2;
-			const int N_q = M_y - 2;
-			const int M   = N_p * N_q;
-
-			auto index_of = [&](int p, int q) { return (p - 1) * N_q + (q - 1); };
-			auto is_unknown = [&](int p, int q) {
-				return p >= 1 && p <= M_x - 2 && q >= 1 && q <= M_y - 2;
-			};
-
-			// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
-			// Eq. (4.123) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
-			// the eigenvalue is n_eff^2.
-			std::vector<Eigen::Triplet<double>> triplets;
-			triplets.reserve(5 * static_cast<size_t>(M));
-
-			for (int p = 1; p <= M_x - 2; ++p) {
-				for (int q = 1; q <= M_y - 2; ++q) {
-
-					// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
-					// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
-					const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
-					const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
-					const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
-					const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
-
-					const double eps   = epsilon_r[p][q];
-					const double eps_w = epsilon_r[p - 1][q];
-					const double eps_e = epsilon_r[p + 1][q];
-
-					// Eqs. (4.124)-(4.129): weighting on the x-neighbours (w, e),
-					// plain Laplacian in y.
-					const double alpha_w = 2.0 / (w * (e + w)) * (2.0 * eps) / (eps + eps_w);
-					const double alpha_e = 2.0 / (e * (e + w)) * (2.0 * eps) / (eps + eps_e);
-					const double alpha_n = 2.0 / (n * (n + s));
-					const double alpha_s = 2.0 / (s * (n + s));
-
-					const double alpha_x = -alpha_e - alpha_w;   // (4.128)
-					const double alpha_y = -alpha_n - alpha_s;   // (4.129)
-
-					const int r = index_of(p, q);
-
-					triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
-
-					// Couplings to neighbours; neighbours on the Dirichlet boundary
-					// are zero and are simply dropped.
-					if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
-					if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
-					if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
-					if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
-				}
-			}
-
-			Eigen::SparseMatrix<double> A(M, M);
-			A.setFromTriplets(triplets.begin(), triplets.end());
-			A.makeCompressed();
-
-			if (write_to_console == true)
-				std::cout << "Matrix size: " << M << " x " << M << "\n(dx=" << dx*1e6 
-					<< "um dy=" << dy*1e6 << "um)" << std::endl;
-
-			// ---- shift-invert eigen solve -----------------------------------------
-			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
-			// targets the highest-index (fundamental) modes.
-			const double sigma = core_index * core_index /*+ 0.05*/;
-
-			Spectra::SparseGenRealShiftSolve<double> op(A);
-			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
-				eigs(op, num_modes, ncv, sigma);
-
-			eigs.init();
-			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
-			
-			if(write_to_console == true)
-				if (eigs.info() != Spectra::CompInfo::Successful) {
-					std::cerr << "Eigen solve did not converge ("
-							   << " of " << num_modes
-							  << " converged). Try increasing ncv.\n";
-					return;
-				}
-
-			Eigen::VectorXcd eigenvalues = eigs.eigenvalues();
-			Eigen::MatrixXcd V           = eigs.eigenvectors();
-
-			// Sort by n_eff^2 descending
-			std::vector<std::pair<double, int>> order;
-			for (int i = 0; i < eigenvalues.size(); ++i)
-				order.emplace_back(eigenvalues[i].real(), i);
-			std::sort(order.begin(), order.end(),
-					  [](const auto& a, const auto& b) { return a.first > b.first; });
-
-			std::cout << std::fixed << std::setprecision(6);
-			for (size_t m = 0; m < order.size(); ++m) {
-				const double neff2 = order[m].first;
-				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
-				const bool guided  = (neff > clad_index && neff < core_index);
-				if(write_to_console == true) 
-					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
-						  << "  n_eff = " << neff
-						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
-			}
-
-			// ---- export -----------------------------------------------------------
-			// Files: x[um] y[um] Re(E) Im(E) |E|^2, normalised to max |E| = 1.
-			// Eigenvectors are real up to a global phase; rotate so the peak is real.
-			
-			if(write_files_out == true) {
-				for (size_t m = 0; m < order.size(); ++m) {
-					const int col = order[m].second;
-
-					int peak = 0;
-					V.col(col).cwiseAbs().maxCoeff(&peak);
-					const std::complex<double> phase = V(peak, col);
-					const double max_E = std::abs(phase);
-
-					std::ofstream file("H_TE_mode_" + std::to_string(m + 1) + ".dat");
-					file << std::setprecision(10);
-
-					for (int p = 0; p < M_x; ++p) {
-						for (int q = 0; q < M_y; ++q) {
-							std::complex<double> E(0.0, 0.0);   // zero on Dirichlet boundary
-							if (is_unknown(p, q) && max_E > 0.0)
-								E = V(index_of(p, q), col) / phase;   // peak -> +1
-
-							file << spatial_pos[0][p] * 1e6 << " "
-								 << spatial_pos[1][q] * 1e6 << " "
-								 << E.real() << " " << E.imag() << " "
-								 << std::norm(E) << "\n";
-						}
-						file << "\n";
-					}
-				}
-			}
+		void E_TE() {
+			solve_arbitrary_mode(0);
 		}
 		
 		void E_TM() {
-			if(this->mesh_initilised != true){
-				throw std::runtime_error("Simulation mesh not initialised.\n");
-				return;
-			}
-
-			const int N_p = M_x - 2;
-			const int N_q = M_y - 2;
-			const int M   = N_p * N_q;
-
-			auto index_of = [&](int p, int q) { return (p - 1) * N_q + (q - 1); };
-			auto is_unknown = [&](int p, int q) {
-				return p >= 1 && p <= M_x - 2 && q >= 1 && q <= M_y - 2;
-			};
-
-			// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
-			// Eq. (4.133) in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
-			// the eigenvalue is n_eff^2.
-			std::vector<Eigen::Triplet<double>> triplets;
-			triplets.reserve(5 * static_cast<size_t>(M));
-
-			for (int p = 1; p <= M_x - 2; ++p) {
-				for (int q = 1; q <= M_y - 2; ++q) {
-
-					// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
-					// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
-					const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
-					const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
-					const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
-					const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
-
-					const double eps   = epsilon_r[p][q];
-					const double eps_n = epsilon_r[p][q - 1];
-					const double eps_s = epsilon_r[p][q + 1];
-
-					// Eqs. (4.134)-(4.139). Note the permittivity weighting sits on the
-					// y-neighbours (n, s), the opposite of the quasi-TE case.
-					const double alpha_w = 2.0 / (w * (e + w));
-					const double alpha_e = 2.0 / (e * (e + w));
-					const double alpha_n = 2.0 / (n * (n + s)) * (2.0 * eps_n) / (eps + eps_n);
-					const double alpha_s = 2.0 / (s * (n + s)) * (2.0 * eps_s) / (eps + eps_s);
-
-					const double alpha_x = -alpha_e - alpha_w;                   // (4.138)
-					const double alpha_y = -4.0 / (n * s) + alpha_n + alpha_s;   // (4.139)
-
-					const int r = index_of(p, q);
-
-					triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
-
-					// Couplings to neighbours; neighbours on the Dirichlet boundary
-					// are zero and are simply dropped.
-					if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
-					if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
-					if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
-					if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
-				}
-			}
-
-
-			Eigen::SparseMatrix<double> A(M, M);
-			A.setFromTriplets(triplets.begin(), triplets.end());
-			A.makeCompressed();
-
-			if (write_to_console == true)
-				std::cout << "Matrix size: " << M << " x " << M << "\n(dx=" << dx*1e6 
-					<< "um dy=" << dy*1e6 << "um)" << std::endl;
-
-			// ---- shift-invert eigen solve -----------------------------------------
-			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
-			// targets the highest-index (fundamental) modes.
-			const double sigma = core_index * core_index /*+ 0.05*/;
-
-			Spectra::SparseGenRealShiftSolve<double> op(A);
-			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
-				eigs(op, num_modes, ncv, sigma);
-
-			eigs.init();
-			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
-			
-			if(write_to_console == true)
-				if (eigs.info() != Spectra::CompInfo::Successful) {
-					std::cerr << "Eigen solve did not converge ("
-							   << " of " << num_modes
-							  << " converged). Try increasing ncv.\n";
-					return;
-				}
-
-			Eigen::VectorXcd eigenvalues = eigs.eigenvalues();
-			Eigen::MatrixXcd V           = eigs.eigenvectors();
-
-			// Sort by n_eff^2 descending
-			std::vector<std::pair<double, int>> order;
-			for (int i = 0; i < eigenvalues.size(); ++i)
-				order.emplace_back(eigenvalues[i].real(), i);
-			std::sort(order.begin(), order.end(),
-					  [](const auto& a, const auto& b) { return a.first > b.first; });
-
-			std::cout << std::fixed << std::setprecision(6);
-			for (size_t m = 0; m < order.size(); ++m) {
-				const double neff2 = order[m].first;
-				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
-				const bool guided  = (neff > clad_index && neff < core_index);
-				if(write_to_console == true) 
-					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
-						  << "  n_eff = " << neff
-						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
-			}
-
-			// ---- export -----------------------------------------------------------
-			// Files: x[um] y[um] Re(E) Im(E) |E|^2, normalised to max |E| = 1.
-			// Eigenvectors are real up to a global phase; rotate so the peak is real.
-			
-			if(write_files_out == true) {
-				for (size_t m = 0; m < order.size(); ++m) {
-					const int col = order[m].second;
-
-					int peak = 0;
-					V.col(col).cwiseAbs().maxCoeff(&peak);
-					const std::complex<double> phase = V(peak, col);
-					const double max_E = std::abs(phase);
-
-					std::ofstream file("E_TM_mode_" + std::to_string(m + 1) + ".dat");
-					file << std::setprecision(10);
-
-					for (int p = 0; p < M_x; ++p) {
-						for (int q = 0; q < M_y; ++q) {
-							std::complex<double> E(0.0, 0.0);   // zero on Dirichlet boundary
-							if (is_unknown(p, q) && max_E > 0.0)
-								E = V(index_of(p, q), col) / phase;   // peak -> +1
-
-							file << spatial_pos[0][p] * 1e6 << " "
-								 << spatial_pos[1][q] * 1e6 << " "
-								 << E.real() << " " << E.imag() << " "
-								 << std::norm(E) << "\n";
-						}
-						file << "\n";
-					}
-				}
-			}
-
+			solve_arbitrary_mode(1);
+		}
+		
+		void H_TE() {
+			solve_arbitrary_mode(2);
 		}
 		
 		void H_TM() {
-			if(this->mesh_initilised != true){
-				throw std::runtime_error("Simulation mesh not initialised.\n");
-				return;
-			}
-
-			const int N_p = M_x - 2;
-			const int N_q = M_y - 2;
-			const int M   = N_p * N_q;
-
-			auto index_of = [&](int p, int q) { return (p - 1) * N_q + (q - 1); };
-			auto is_unknown = [&](int p, int q) {
-				return p >= 1 && p <= M_x - 2 && q >= 1 && q <= M_y - 2;
-			};
-
-			// ---- assemble A  (A E = (beta/k0)^2 E = n_eff^2 E) --------------------
-			// Eq. (4.123) with x <-> y, in normalised coordinates x_bar = k0*x, so k0^2 -> 1 and
-			// the eigenvalue is n_eff^2.
-			std::vector<Eigen::Triplet<double>> triplets;
-			triplets.reserve(5 * static_cast<size_t>(M));
-
-			for (int p = 1; p <= M_x - 2; ++p) {
-				for (int q = 1; q <= M_y - 2; ++q) {
-
-					// Spacings, Eqs. (4.56)-(4.59): w = x_p - x_{p-1}, e = x_{p+1} - x_p,
-					// n = y_q - y_{q-1}, s = y_{q+1} - y_q  (normalised by 1/k0).
-					const double w = k_0 * std::abs(spatial_pos[0][p]     - spatial_pos[0][p - 1]);
-					const double e = k_0 * std::abs(spatial_pos[0][p + 1] - spatial_pos[0][p]);
-					const double n = k_0 * std::abs(spatial_pos[1][q]     - spatial_pos[1][q - 1]);
-					const double s = k_0 * std::abs(spatial_pos[1][q + 1] - spatial_pos[1][q]);
-
-					const double eps   = epsilon_r[p][q];
-					const double eps_n = epsilon_r[p][q - 1];
-					const double eps_s = epsilon_r[p][q + 1];
-
-					// (4.124)-(4.129) with x <-> y, Eq. (4.141): weighting on the
-					// y-neighbours (n, s), plain Laplacian in x.
-					const double alpha_w = 2.0 / (w * (e + w));
-					const double alpha_e = 2.0 / (e * (e + w));
-					const double alpha_n = 2.0 / (n * (n + s)) * (2.0 * eps) / (eps + eps_n);
-					const double alpha_s = 2.0 / (s * (n + s)) * (2.0 * eps) / (eps + eps_s);
-
-					const double alpha_x = -alpha_e - alpha_w;
-					const double alpha_y = -alpha_n - alpha_s;
-
-					const int r = index_of(p, q);
-
-					triplets.emplace_back(r, r, alpha_x + alpha_y + eps);   // k0^2*eps -> eps
-
-					// Couplings to neighbours; neighbours on the Dirichlet boundary
-					// are zero and are simply dropped.
-					if (is_unknown(p - 1, q)) triplets.emplace_back(r, index_of(p - 1, q), alpha_w);
-					if (is_unknown(p + 1, q)) triplets.emplace_back(r, index_of(p + 1, q), alpha_e);
-					if (is_unknown(p, q - 1)) triplets.emplace_back(r, index_of(p, q - 1), alpha_n);
-					if (is_unknown(p, q + 1)) triplets.emplace_back(r, index_of(p, q + 1), alpha_s);
-				}
-			}
-
-			Eigen::SparseMatrix<double> A(M, M);
-			A.setFromTriplets(triplets.begin(), triplets.end());
-			A.makeCompressed();
-
-			if (write_to_console == true)
-				std::cout << "Matrix size: " << M << " x " << M << "\n(dx=" << dx*1e6 
-					<< "um dy=" << dy*1e6 << "um)" << std::endl;
-
-			// ---- shift-invert eigen solve -----------------------------------------
-			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
-			// targets the highest-index (fundamental) modes.
-			const double sigma = core_index * core_index /*+ 0.05*/;
-
-			Spectra::SparseGenRealShiftSolve<double> op(A);
-			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
-				eigs(op, num_modes, ncv, sigma);
-
-			eigs.init();
-			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
-			
-			if(write_to_console == true)
-				if (eigs.info() != Spectra::CompInfo::Successful) {
-					std::cerr << "Eigen solve did not converge ("
-							   << " of " << num_modes
-							  << " converged). Try increasing ncv.\n";
-					return;
-				}
-
-			Eigen::VectorXcd eigenvalues = eigs.eigenvalues();
-			Eigen::MatrixXcd V           = eigs.eigenvectors();
-
-			// Sort by n_eff^2 descending
-			std::vector<std::pair<double, int>> order;
-			for (int i = 0; i < eigenvalues.size(); ++i)
-				order.emplace_back(eigenvalues[i].real(), i);
-			std::sort(order.begin(), order.end(),
-					  [](const auto& a, const auto& b) { return a.first > b.first; });
-
-			std::cout << std::fixed << std::setprecision(6);
-			for (size_t m = 0; m < order.size(); ++m) {
-				const double neff2 = order[m].first;
-				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
-				const bool guided  = (neff > clad_index && neff < core_index);
-				if(write_to_console == true) 
-					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
-						  << "  n_eff = " << neff
-						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
-			}
-
-			// ---- export -----------------------------------------------------------
-			// Files: x[um] y[um] Re(E) Im(E) |E|^2, normalised to max |E| = 1.
-			// Eigenvectors are real up to a global phase; rotate so the peak is real.
-			
-			if(write_files_out == true) {
-				for (size_t m = 0; m < order.size(); ++m) {
-					const int col = order[m].second;
-
-					int peak = 0;
-					V.col(col).cwiseAbs().maxCoeff(&peak);
-					const std::complex<double> phase = V(peak, col);
-					const double max_E = std::abs(phase);
-
-					std::ofstream file("H_TM_mode_" + std::to_string(m + 1) + ".dat");
-					file << std::setprecision(10);
-
-					for (int p = 0; p < M_x; ++p) {
-						for (int q = 0; q < M_y; ++q) {
-							std::complex<double> E(0.0, 0.0);   // zero on Dirichlet boundary
-							if (is_unknown(p, q) && max_E > 0.0)
-								E = V(index_of(p, q), col) / phase;   // peak -> +1
-
-							file << spatial_pos[0][p] * 1e6 << " "
-								 << spatial_pos[1][q] * 1e6 << " "
-								 << E.real() << " " << E.imag() << " "
-								 << std::norm(E) << "\n";
-						}
-						file << "\n";
-					}
-				}
-			}
-
+			solve_arbitrary_mode(3);
 		}
 		
 		void solve_modes(){
