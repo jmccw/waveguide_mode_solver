@@ -3,12 +3,19 @@
 #ifndef WG_SOLVER_H
 #define WG_SOLVER_H
  
+#include <algorithm>
+#include <cmath>
 #include <complex>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
- 
+
 #include <Eigen/Sparse>
+#include <Spectra/GenEigsRealShiftSolver.h>
+#include <Spectra/MatOp/SparseGenRealShiftSolve.h>
  
 // ---------------------------------------------------------------------------
 // Types

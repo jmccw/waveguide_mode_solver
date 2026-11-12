@@ -1,5 +1,6 @@
 // Jordan Walsh, Integrated Photonics
 // jordan.walsh@tyndall.ie
+// g++ -O2 -std=c++17 main.cpp -I/usr/include/eigen3 -Ispectra/include -fopenmp -o main
 //
 // Semivectorial finite-difference mode solver
 // Ref: Kawano & Kitoh, "Introduction to Optical Waveguide Analysis", Ch. 4,
@@ -15,11 +16,13 @@
 #include <utility>
 #include <vector>
 
-#include "wg_solver.h"
-
 #include <Eigen/Sparse>
 #include <Spectra/GenEigsRealShiftSolver.h>
 #include <Spectra/MatOp/SparseGenRealShiftSolve.h>
+
+#include "wg_solver.h"
+
+
 
 // ---------------------------------------------------------------------------
 // Structure parameters (square core waveguide - unrelated to rib WG)
@@ -32,14 +35,6 @@ static const double block_size = 3.4e-6;   // full computational window
 // misc. constants
 const double n_SiO2 = 1.444;
 const double n_air = 1.0;
-
-// Result of the eigen solve, sorted by n_eff^2 (descending) via `order`.
-//~ struct ModeResult {
-    //bool               converged = false;
-    //~ Eigen::VectorXcd   eigenvalues;
-    //~ Eigen::MatrixXcd   eigenvectors;
-    //~ std::vector<std::pair<double, int>> order;   // (n_eff^2, column index)
-//~ };
 
 class wg_simulation {
 	
@@ -55,8 +50,8 @@ class wg_simulation {
 		std::vector<ModeResult> computed_modes = std::vector<ModeResult>(4);
 		// [0] = E_TE, [1] = E_TM, [2] = H_TE, [3] = H_TM
 		
-		double dx = 5e-9;
-		double dy = 50e-9;
+		double dx = 100e-9;
+		double dy = 5e-9;
 		double lambda = 1550e-9;
 		double k_0    = 2.0 * M_PI / lambda;
 
@@ -650,14 +645,6 @@ class wg_simulation {
 		
 		// Threaded function sets up matrices in parallel and solves
 		sim1.solve_modes();
-		
-		// ..or to compute one type individually
-		//~ sim1.E_TE();
-
-		// This version supports constant uniform grid spacing, dx and 
-		//   dy can be set independantly using:
-		//~ sim1.set_dx();
-		//~ sim1.set_dy();
 
 		return 0;
 	}
