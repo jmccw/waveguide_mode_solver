@@ -36,6 +36,24 @@ static const double block_size = 3.4e-6;   // full computational window
 const double n_SiO2 = 1.444;
 const double n_air = 1.0;
 
+
+struct EpiProfile {
+    std::vector<double> profile_y;
+    std::vector<double> profile_n;
+
+    EpiProfile(std::vector<double> y_in, std::vector<double> n_in)
+        : profile_y(std::move(y_in)), profile_n(std::move(n_in))
+    {
+        if (profile_y.size() != profile_n.size())
+            throw std::runtime_error("Mismatched vector sizes for input epitaxy profiles.");
+        if (profile_y.size() < 2)
+            throw std::runtime_error("Epitaxy profile must contain at least two points.");
+        if (!std::is_sorted(profile_y.begin(), profile_y.end()))
+            throw std::runtime_error("Epitaxy profile coordinates must be sorted in ascending order.");
+    }
+};
+
+
 class wg_simulation {
 	
 	private:
@@ -47,13 +65,16 @@ class wg_simulation {
 		std::vector<std::vector<double>> epsilon_r;
 		
 		std::vector<std::string> string_mode_type = {"E_TE_", "E_TM_", "H_TE_", "H_TM_"};
+		std::string file_name_profile_n = "refractive_index_profile.dat"; // By default
+		
 		std::vector<ModeResult> computed_modes = std::vector<ModeResult>(4);
-		// [0] = E_TE, [1] = E_TM, [2] = H_TE, [3] = H_TM
+									// [0] = E_TE, [1] = E_TM, [2] = H_TE, [3] = H_TM
 		
 		double dx = 100e-9;
 		double dy = 5e-9;
 		double lambda = 1550e-9;
 		double k_0    = 2.0 * M_PI / lambda;
+		double air_thickness = 0.0; // default 0.0, determined from profile read in.
 
 		// Misc. solver parameters (ignore)
 		const int num_modes = 10;	// number of modes to solve for.
@@ -63,11 +84,13 @@ class wg_simulation {
 		int N_p;
 		int N_q;
 		int M;
+		double sigma = 0.0, sigma_offset = 0.05;
 
 		
 		bool write_files_out = true;
 		bool write_to_console = true;
 		
+		bool profile_n_initialised = false;
 		bool mesh_initilised = false; // false by default.
 			// user should define a mesh type.
 			
@@ -322,11 +345,9 @@ class wg_simulation {
 			// Eigenvalues closest to sigma are returned. sigma just above n_core^2
 			// targets the highest-index (fundamental) modes.
 			
-			const double sigma = core_index * core_index + 0.05;
-
 			Spectra::SparseGenRealShiftSolve<double> op(A);
 			Spectra::GenEigsRealShiftSolver<Spectra::SparseGenRealShiftSolve<double>>
-				eigs(op, num_modes, ncv, sigma);
+				eigs(op, num_modes, ncv, this->sigma);
 
 			eigs.init();
 			eigs.compute(Spectra::SortRule::LargestMagn);   // largest 1/(lambda - sigma)
@@ -353,12 +374,13 @@ class wg_simulation {
 			for (size_t m = 0; m < order.size(); ++m) {
 				const double neff2 = order[m].first;
 				const double neff  = (neff2 > 0.0) ? std::sqrt(neff2) : 0.0;
-				const bool guided  = (neff > clad_index && neff < core_index);
+				const bool guided  = (neff > profile_n[profile_n.size()-1] && neff < std::sqrt(sigma));
+				//~ std::cout << "profile_y[]=" << profile_n[profile_n.size()-1] << "std::sqrt(sigma)=" << std::sqrt(sigma) << std::endl;
 				if(write_to_console == true) 
-					std::cout << "Mode " << m + 1 << ": n_eff^2 = " << neff2
+					std::cout << "Mode " << string_mode_type[mode_type] << m + 1 << ": n_eff^2 = " << neff2
 						  << "  n_eff = " << neff
 						  << (guided ? "  (guided)" : "  (not guided / box mode)") << '\n';
-			} // FIXME: The logic here does not work for an arbitrary rib WG.
+			} // FIXME: The logic here still does not work for identifying guided modes.
 			
 			// Add to ModeResult struct.
 			this->computed_modes[mode_type] = ModeResult {eigenvalues, V, order};
@@ -414,6 +436,10 @@ class wg_simulation {
 			// mesh_initialisation(false);
 		}
 		
+		void set_file_name_refractive_index_profile(std::string filename_in) {
+			this->file_name_profile_n = filename_in;
+		}
+		
 		int get_M_x() const 
 		{
 			//~ if (M_x == 0) throw std::logic_error("M_x not initialised");
@@ -426,30 +452,22 @@ class wg_simulation {
 			return M_y;
 		}
 		
-		// Cell-centred mesh: node p sits at x = -L/2 + (p + 0.5)*dx, dx = L/M.
-		// Cell edges are at -L/2 + k*dx, so the core edge (+/- core_size/2) must be
-		void initialise_rib_WG(
-			double etch_depth_in, 
-			double wg_width_in, 
-			double window_width_in, 
-			double dielectric_thickness_in)
-		{
-			this->etch_depth = etch_depth_in;
-			this->wg_width = wg_width_in;
-			this->window_width = window_width_in;
-			this->dielectric_thickness = dielectric_thickness_in;
-
+		void initialise_refractive_index_profile() {
+			
 			// ---------------------------------------------------------
 			// Read refractive-index profile: z [m], n
 			// Here the profile coordinate is interpreted as vertical y.
 			// ---------------------------------------------------------
+			
 			std::vector<double> profile_y;
 			std::vector<double> profile_n;
-
-			std::ifstream profile_file("refractive_index_profile.dat");
+			
+			// Case: read in from file.
+			
+			std::ifstream profile_file(file_name_profile_n);
 			if (!profile_file) {
 				throw std::runtime_error(
-					"Cannot open refractive_index_profile.dat");
+					"Cannot open " + this->file_name_profile_n);
 			}
 
 			std::string line;
@@ -472,13 +490,72 @@ class wg_simulation {
 				}
 				i++;
 			}
+						
+			this->air_thickness = std::abs(profile_y[0] - profile_y[idx_air_end]); // 1.5e-6 in example file.
+
+			this->profile_y = profile_y;
+			this->profile_n = profile_n;
+
+			auto it = std::max_element(profile_n.begin(), profile_n.end());   // looking for max n value
+			double max_val_n = *it;
+			this->sigma = max_val_n*max_val_n + sigma_offset; // This is the matrix shift for efficient solving of fundamental modes.
+			std::cout << "sigma=" << this->sigma << " max_val_n=" << max_val_n << std::endl;
 			
-			// Read refractive index profile, determine distance from window edge 
-			// to actual beggining of epi structure (this is so that when an air 
-			// block is included in the input refractive index profile file the 
-			// correct etch depth is used).
+			mesh_initialisation(false);
+			this->profile_n_initialised = true;
+		}
+		
+		void initialise_refractive_index_profile(EpiProfile input) {
 			
-			double air_thickness = std::abs(profile_y[0] - profile_y[idx_air_end]); // 1.5e-6 in example file.
+			// ---------------------------------------------------------
+			// Read refractive-index profile: z [m], n
+			// Here the profile coordinate is interpreted as vertical y.
+			// ---------------------------------------------------------
+
+			// Case: read in from memory (to be written)
+
+			const std::vector<double>& profile_y = input.profile_y;
+			const std::vector<double>& profile_n = input.profile_n;
+
+			// First point that is no longer air (n >= 1.01).
+			auto idx = std::find_if(profile_n.begin(), profile_n.end(),
+								   [](double n) { return n >= 1.01; });
+
+			if (idx == profile_n.end())
+				throw std::runtime_error("Profile contains no material layer (n >= 1.01).");
+
+			const size_t idx_air_end = std::distance(profile_n.begin(), idx);
+
+			this->air_thickness = std::abs(profile_y[0] - profile_y[idx_air_end]);   // 1.5e-6 in example fil
+
+			this->profile_y = profile_y;
+			this->profile_n = profile_n;
+
+			auto it = std::max_element(profile_n.begin(), profile_n.end());   // looking for max n value
+			double max_val_n = *it;
+			this->sigma = max_val_n*max_val_n + sigma_offset; // This is the matrix shift for efficient solving of fundamental modes.
+			std::cout << "sigma=" << this->sigma << " max_val_n=" << max_val_n << std::endl;
+			
+			mesh_initialisation(false);
+			this->profile_n_initialised = true;
+		}
+		
+		// Cell-centred mesh: node p sits at x = -L/2 + (p + 0.5)*dx, dx = L/M.
+		// Cell edges are at -L/2 + k*dx, so the core edge (+/- core_size/2) must be
+		void initialise_rib_WG(
+			double etch_depth_in, 
+			double wg_width_in, 
+			double window_width_in, 
+			double dielectric_thickness_in)
+		{
+			this->etch_depth = etch_depth_in;
+			this->wg_width = wg_width_in;
+			this->window_width = window_width_in;
+			this->dielectric_thickness = dielectric_thickness_in;
+			
+			// May need a check to see what mode the prgram is operating in.
+			if(this->profile_n_initialised == false) initialise_refractive_index_profile();
+
 			if(write_to_console == true) std:: cout << "air_thickness=" << air_thickness*1e6 << "um"<< std::endl;
 
 			if (profile_y.size() < 2) {
@@ -549,6 +626,7 @@ class wg_simulation {
 			// ---------------------------------------------------------
 			// Build epsilon_r(x,y)
 			// ---------------------------------------------------------
+
 			for (int p = 0; p < M_x; ++p) {
 				for (int q = 0; q < M_y; ++q) {
 					const double n = interpolate_n(y[q]);
@@ -569,8 +647,8 @@ class wg_simulation {
 			
 			this->epsilon_r = epsilon_r;
 			this->spatial_pos = spatial_pos;
-			this->profile_n = profile_n;
-			this->profile_y = profile_y;
+			//~ this->profile_n = profile_n;
+			//~ this->profile_y = profile_y;
 
 			// ---------------------------------------------------------
 			// Write mesh: x [um], y [um], relative permittivity
@@ -633,18 +711,40 @@ class wg_simulation {
 		}
 };
 	
-	int main(int argc, char* argv[])
-	{
-		setvbuf(stdout, NULL, _IONBF, 0);
-		
-		// Create simulation object.
-		wg_simulation sim1;
-		
-		// Arbitrary mesh initialiser (user can create their own)
-		sim1.initialise_rib_WG(1.85e-6, 2e-6, 10e-6, 300e-9);
-		
-		// Threaded function sets up matrices in parallel and solves
-		sim1.solve_modes();
+int main(int argc, char* argv[])
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	
+	// Create simulation object.
+	wg_simulation sim1;
+	
+	// Arbitrary mesh initialiser (user can create their own)
+	sim1.set_file_name_refractive_index_profile("IQE_n_profile.dat");
+	
+	// Now I need to wrap this in PTG parameter code 
+	//  wg_solver will interpolate linearly between nodes set here.
+	//  y_input to EpiProfile does not need to be symmetric.
+	//  Define air region first.
+	
+	std::vector<double> external_y = {0.0e-6, 0.5e-6, 0.5e-6, 1.0e-6, 1.0e-6, 3.0e-6};
+	std::vector<double> external_n = {1.0,    1.0,    1.44,   1.44,   3.0,    3.0};
+	
+	EpiProfile epitaxy(external_y, external_n);
+	
+	sim1.initialise_refractive_index_profile(epitaxy);
+	sim1.initialise_rib_WG(1.85e-6, 2e-6, 10e-6, 300e-9);
+	
+	// Threaded function sets up matrices in parallel and solves
+	sim1.solve_modes();
+	
+	
+	// New program operation:
+	//  - Give an arbitrary QW / active region
+	//  - Number of QWs
+	//  - Define a cladding either side (simpler than file read in).
+	//  - I think we should stick to keeping the wg_solver working
+	//    from a refractive index profile vector.
+	//  - To define the refractive index profile we need a seperate callable package.
 
-		return 0;
-	}
+	return 0;
+}

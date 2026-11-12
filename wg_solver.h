@@ -1,5 +1,8 @@
 // Semivectorial finite-difference mode solver, quasi-TE (E_x representation)
 // Ref: Kawano & Kitoh, "Introduction to Optical Waveguide Analysis", Ch. 4.
+
+// g++ -O2 -std=c++17 -I/usr/include/eigen3 -Ispectra/include -fopenmp -x c++-header wg_solver.h -o wg_solver.h.gch
+
 #ifndef WG_SOLVER_H
 #define WG_SOLVER_H
  
@@ -30,7 +33,8 @@ struct ModeResult {
     Eigen::MatrixXcd   eigenvectors;
     std::vector<std::pair<double, int>> order;   // (n_eff^2, column index)
 };
- 
+
+
 // ---------------------------------------------------------------------------
 // Structure parameters (C++17 inline constants: one definition, safe in headers)
 // ---------------------------------------------------------------------------
