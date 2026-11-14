@@ -40,19 +40,25 @@ const double n_air = 1.0;
 struct EpiProfile {
     std::vector<double> profile_y;
     std::vector<double> profile_n;
+    std::vector<int> profile_is_active;
+	std::vector<std::vector<int>> active_map;   // active_map[p][q] in [0,1], same grid as epsilon_r
 
-    EpiProfile(std::vector<double> y_in, std::vector<double> n_in)
-        : profile_y(std::move(y_in)), profile_n(std::move(n_in))
+    EpiProfile(std::vector<double> y_in,
+               std::vector<double> n_in,
+               std::vector<int>    profile_is_active_in)
+        : profile_y(std::move(y_in)),
+          profile_n(std::move(n_in)),
+          profile_is_active(std::move(profile_is_active_in))
     {
-        if (profile_y.size() != profile_n.size())
-            throw std::runtime_error("Mismatched vector sizes for input epitaxy profiles.");
+        if (profile_y.size() != profile_n.size() ||
+            profile_y.size() != profile_is_active.size())
+            throw std::runtime_error("Mismatched vector sizes for input profiles.");
         if (profile_y.size() < 2)
-            throw std::runtime_error("Epitaxy profile must contain at least two points.");
+            throw std::runtime_error("Profile must contain at least two points.");
         if (!std::is_sorted(profile_y.begin(), profile_y.end()))
-            throw std::runtime_error("Epitaxy profile coordinates must be sorted in ascending order.");
+            throw std::runtime_error("Profile coordinates must be sorted in ascending order.");
     }
 };
-
 
 class wg_simulation {
 	
@@ -60,9 +66,11 @@ class wg_simulation {
 	
 		std::vector<double> profile_y;
 		std::vector<double> profile_n;
+		std::vector<int> profile_is_active;
 		
 		std::vector<std::vector<double>> spatial_pos;
 		std::vector<std::vector<double>> epsilon_r;
+		std::vector<std::vector<int>> active_map;
 		
 		std::vector<std::string> string_mode_type = {"E_TE_", "E_TM_", "H_TE_", "H_TM_"};
 		std::string file_name_profile_n = "refractive_index_profile.dat"; // By default
@@ -461,7 +469,6 @@ class wg_simulation {
 			
 			std::vector<double> profile_y;
 			std::vector<double> profile_n;
-			
 			// Case: read in from file.
 			
 			std::ifstream profile_file(file_name_profile_n);
@@ -495,6 +502,9 @@ class wg_simulation {
 
 			this->profile_y = profile_y;
 			this->profile_n = profile_n;
+			
+			// empty active profile for non-read in profiles.
+			this->profile_is_active.assign(profile_y.size(), 0);
 
 			auto it = std::max_element(profile_n.begin(), profile_n.end());   // looking for max n value
 			double max_val_n = *it;
@@ -530,6 +540,7 @@ class wg_simulation {
 
 			this->profile_y = profile_y;
 			this->profile_n = profile_n;
+			this->profile_is_active = input.profile_is_active;
 
 			auto it = std::max_element(profile_n.begin(), profile_n.end());   // looking for max n value
 			double max_val_n = *it;
@@ -588,25 +599,37 @@ class wg_simulation {
 				y -= profile_mid;
 
 			// Linear interpolation of n(y).
-			auto interpolate_n = [&](double y) -> double {
-				if (y <= profile_y.front())
-					return profile_n.front();
+			//~ auto interpolate_n = [&](double y) -> double {
+				//~ if (y <= profile_y.front())
+					//~ return profile_n.front();
 
-				if (y >= profile_y.back())
-					return profile_n.back();
+				//~ if (y >= profile_y.back())
+					//~ return profile_n.back();
 
-				auto it = std::upper_bound(
-					profile_y.begin(), profile_y.end(), y);
+				//~ auto it = std::upper_bound(
+					//~ profile_y.begin(), profile_y.end(), y);
 
-				const std::size_t i =
-					static_cast<std::size_t>(it - profile_y.begin() - 1);
+				//~ const std::size_t i =
+					//~ static_cast<std::size_t>(it - profile_y.begin() - 1);
 
-				const double t =
-					(y - profile_y[i]) /
-					(profile_y[i + 1] - profile_y[i]);
+				//~ const double t =
+					//~ (y - profile_y[i]) /
+					//~ (profile_y[i + 1] - profile_y[i]);
 
-				return profile_n[i] +
-					t * (profile_n[i + 1] - profile_n[i]);
+				//~ return profile_n[i] +
+					//~ t * (profile_n[i + 1] - profile_n[i]);
+			//~ };
+
+			// Linear interpolation of any per-node profile onto y.
+			auto interpolate = [&](const auto& values, double y) -> double {
+				if (y <= profile_y.front()) return values.front();
+				if (y >= profile_y.back())  return values.back();
+
+				auto it = std::upper_bound(profile_y.begin(), profile_y.end(), y);
+				const std::size_t i = static_cast<std::size_t>(it - profile_y.begin() - 1);
+
+				const double t = (y - profile_y[i]) / (profile_y[i + 1] - profile_y[i]);
+				return values[i] + t * (values[i + 1] - values[i]);
 			};
 
 			// ---------------------------------------------------------
@@ -626,10 +649,12 @@ class wg_simulation {
 			// ---------------------------------------------------------
 			// Build epsilon_r(x,y)
 			// ---------------------------------------------------------
-
+			std::vector<std::vector<int>> active_map(M_x, std::vector<int>(M_y, 0.0));			
 			for (int p = 0; p < M_x; ++p) {
 				for (int q = 0; q < M_y; ++q) {
-					const double n = interpolate_n(y[q]);
+					const double n = interpolate(profile_n, y[q]);
+					active_map[p][q] = interpolate(profile_is_active, y[q]);
+		
 					// Rib defintion
 					if(std::abs(x[p]) <= wg_width/2.0) epsilon_r[p][q] = n * n;
 					else epsilon_r[p][q] = n_air * n_air;
@@ -647,11 +672,12 @@ class wg_simulation {
 			
 			this->epsilon_r = epsilon_r;
 			this->spatial_pos = spatial_pos;
+			this->active_map = active_map;
 			//~ this->profile_n = profile_n;
 			//~ this->profile_y = profile_y;
 
 			// ---------------------------------------------------------
-			// Write mesh: x [um], y [um], relative permittivity
+			// Write mesh: x [um], y [um], relative permittivity, is_active
 			// ---------------------------------------------------------
 			if(this->write_files_out == true) {
 				std::ofstream file("permittivity_mesh.dat");
@@ -659,12 +685,14 @@ class wg_simulation {
 					throw std::runtime_error("Cannot write permittivity_mesh.dat");
 
 				file << std::setprecision(10);
+				file << "# x[um] y[um] eps_r active\n";
 
 				for (int p = 0; p < M_x; ++p) {
 					for (int q = 0; q < M_y; ++q) {
 						file << x[p] * 1e6 << " "
 							 << y[q] * 1e6 << " "
-							 << epsilon_r[p][q] << "\n";
+							 << epsilon_r[p][q] << " "
+							 << active_map[p][q] << "\n";
 					}
 					file << "\n";
 				}
@@ -709,42 +737,82 @@ class wg_simulation {
 				}   // the implicit barrier at the end of the parallel region waits for all four tasks
 			}
 		}
+		
+		
+		// Fraction of mode m's power (|E|^2) on nodes flagged active.
+		// mode_type: 0 = E_TE, 1 = E_TM, 2 = H_TE, 3 = H_TM
+		// m: index into the sorted mode list (0 = highest n_eff^2)
+		// rib_only: also require |x| <= wg_width/2 (see notes)
+		// Claude wrote this function.
+		
+		double active_confinement(int mode_type, size_t m, bool rib_only = false) const
+		{
+			if (!mesh_initilised)
+				throw std::runtime_error("Simulation mesh not initialised.");
+			if (mode_type < 0 || mode_type >= static_cast<int>(computed_modes.size()))
+				throw std::out_of_range("Invalid mode_type.");
+
+			const ModeResult& mr = computed_modes[mode_type];
+			if (m >= mr.order.size())
+				throw std::out_of_range("Mode not computed (did the solve converge?).");
+
+			const int col = mr.order[m].second;
+			const int Nq  = M_y - 2;
+
+			double P_active = 0.0, P_total = 0.0;
+
+			for (int p = 1; p <= M_x - 2; ++p) {
+				for (int q = 1; q <= M_y - 2; ++q) {
+					const int r = (p - 1) * Nq + (q - 1);          // same as index_of(p, q)
+					const double I = std::norm(mr.eigenvectors(r, col));   // |E|^2
+
+					P_total += I;
+
+					bool in_active = (active_map[p][q] == 1);
+					if (rib_only && std::abs(spatial_pos[0][p]) > wg_width / 2.0)
+						in_active = false;
+
+					if (in_active) P_active += I;
+				}
+			}
+			return (P_total > 0.0) ? P_active / P_total : 0.0;
+		}
 };
 	
-int main(int argc, char* argv[])
-{
-	setvbuf(stdout, NULL, _IONBF, 0);
+//~ int main(int argc, char* argv[])
+//~ {
+	//~ setvbuf(stdout, NULL, _IONBF, 0);
 	
-	// Create simulation object.
-	wg_simulation sim1;
+	//~ // Create simulation object.
+	//~ wg_simulation sim1;
 	
-	// Arbitrary mesh initialiser (user can create their own)
-	sim1.set_file_name_refractive_index_profile("IQE_n_profile.dat");
+	//~ // Arbitrary mesh initialiser (user can create their own)
+	//~ sim1.set_file_name_refractive_index_profile("IQE_n_profile.dat");
 	
-	// Now I need to wrap this in PTG parameter code 
-	//  wg_solver will interpolate linearly between nodes set here.
-	//  y_input to EpiProfile does not need to be symmetric.
-	//  Define air region first.
+	//~ // Now I need to wrap this in PTG parameter code 
+	//~ //  wg_solver will interpolate linearly between nodes set here.
+	//~ //  y_input to EpiProfile does not need to be symmetric.
+	//~ //  Define air region first.
 	
-	std::vector<double> external_y = {0.0e-6, 0.5e-6, 0.5e-6, 1.0e-6, 1.0e-6, 3.0e-6};
-	std::vector<double> external_n = {1.0,    1.0,    1.44,   1.44,   3.0,    3.0};
+	//~ std::vector<double> external_y = {0.0e-6, 0.5e-6, 0.5e-6, 1.0e-6, 1.0e-6, 3.0e-6};
+	//~ std::vector<double> external_n = {1.0,    1.0,    1.44,   1.44,   3.0,    3.0};
 	
-	EpiProfile epitaxy(external_y, external_n);
+	//~ EpiProfile epitaxy(external_y, external_n);
 	
-	sim1.initialise_refractive_index_profile(epitaxy);
-	sim1.initialise_rib_WG(1.85e-6, 2e-6, 10e-6, 300e-9);
+	//~ sim1.initialise_refractive_index_profile(epitaxy);
+	//~ sim1.initialise_rib_WG(1.85e-6, 2e-6, 10e-6, 300e-9);
 	
-	// Threaded function sets up matrices in parallel and solves
-	sim1.solve_modes();
+	//~ // Threaded function sets up matrices in parallel and solves
+	//~ sim1.solve_modes();
 	
 	
-	// New program operation:
-	//  - Give an arbitrary QW / active region
-	//  - Number of QWs
-	//  - Define a cladding either side (simpler than file read in).
-	//  - I think we should stick to keeping the wg_solver working
-	//    from a refractive index profile vector.
-	//  - To define the refractive index profile we need a seperate callable package.
+	//~ // New program operation:
+	//~ //  - Give an arbitrary QW / active region
+	//~ //  - Number of QWs
+	//~ //  - Define a cladding either side (simpler than file read in).
+	//~ //  - I think we should stick to keeping the wg_solver working
+	//~ //    from a refractive index profile vector.
+	//~ //  - To define the refractive index profile we need a seperate callable package.
 
-	return 0;
-}
+	//~ return 0;
+//~ }
